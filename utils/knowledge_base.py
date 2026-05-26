@@ -15,7 +15,9 @@ valid_generation_models = ["anthropic.claude-3-5-sonnet-20240620-v1:0",
                           "anthropic.claude-3-5-haiku-20241022-v1:0", 
                           "anthropic.claude-3-sonnet-20240229-v1:0",
                           "anthropic.claude-3-haiku-20240307-v1:0",
-                          "amazon.nova-micro-v1:0"] 
+                          "amazon.nova-micro-v1:0",
+                          "us.amazon.nova-lite-v1:0",
+                          "us.amazon.nova-micro-v1:0"] 
 
 valid_reranking_models = ["cohere.rerank-v3-5:0",
                           "amazon.rerank-v1:0"] 
@@ -61,7 +63,7 @@ class BedrockKnowledgeBase:
             embedding_model="amazon.titan-embed-text-v2:0",
             generation_model="anthropic.claude-3-sonnet-20240229-v1:0",
             reranking_model="cohere.rerank-v3-5:0",
-            graph_model="anthropic.claude-3-haiku-20240307-v1:0",
+            graph_model="anthropic.claude-haiku-4-5-20251001-v1:0",
             chunking_strategy="FIXED_SIZE",
             suffix=None,
             vector_store="OPENSEARCH_SERVERLESS" # can be OPENSEARCH_SERVERLESS or NEPTUNE_ANALYTICS
@@ -204,6 +206,36 @@ class BedrockKnowledgeBase:
         print(f"Step 5 - Creating Knowledge Base")
         self.knowledge_base, self.data_source = self.create_knowledge_base(self.data_sources)
         print("========================================================================================")
+        if self.chunking_strategy == "CUSTOM" and self.lambda_arn:
+            print("========================================================================================")
+            print(f"Step 6 - Adding Lambda resource policy for Bedrock invocation")
+            self._add_lambda_resource_policy()
+        
+        print("========================================================================================")
+        
+    def _add_lambda_resource_policy(self):
+        """
+        Add resource-based policy to Lambda allowing Bedrock to invoke it.
+        Called after KB creation so the policy is scoped to this account.
+        """
+        statement_id = 'AllowBedrockInvoke'
+        
+        try:
+            self.lambda_client.remove_permission(
+                FunctionName=self.lambda_function_name,
+                StatementId=statement_id
+            )
+        except self.lambda_client.exceptions.ResourceNotFoundException:
+            pass
+        
+        self.lambda_client.add_permission(
+            FunctionName=self.lambda_function_name,
+            StatementId=statement_id,
+            Action='lambda:InvokeFunction',
+            Principal='bedrock.amazonaws.com',
+            SourceAccount=self.account_number
+        )
+        print(f"  ✅ Lambda '{self.lambda_function_name}' allows Bedrock invocation (account: {self.account_number})")
         
     def create_s3_bucket(self, multi_modal=False):
 
@@ -334,6 +366,106 @@ class BedrockKnowledgeBase:
             PolicyArn=s3_access_policy_response['Policy']['Arn']
         )
         return lambda_iam_role
+
+
+
+    def ensure_custom_chunking_permissions(self, kb_id, bucket_name, intermediate_bucket_name, lambda_function_name):
+        """
+        Ensures all permissions are in place for custom chunking ingestion
+        when the KB was originally created with a different chunking strategy.
+        
+        Call this before starting an ingestion job on a custom chunking data source.
+        
+        Handles:
+            1. KB role → S3 access to intermediate bucket
+            2. KB role → lambda:InvokeFunction permission  
+            3. Lambda resource policy → allows Bedrock to invoke
+            
+        Args:
+            kb_id (str): The Knowledge Base ID
+            bucket_name (str): The main data bucket name
+            intermediate_bucket_name (str): The intermediate bucket for Lambda I/O
+            lambda_function_name (str): The custom chunking Lambda function name
+        """
+        print("Ensuring custom chunking permissions are in place...")
+        
+        # Get the KB execution role
+        kb_details = self.bedrock_agent_client.get_knowledge_base(knowledgeBaseId=kb_id)
+        kb_role_arn = kb_details['knowledgeBase']['roleArn']
+        kb_role_name = kb_role_arn.split('/')[-1]
+        print(f"  KB Role: {kb_role_name}")
+        
+        # 1. Grant KB role access to intermediate bucket
+        self.iam_client.put_role_policy(
+            RoleName=kb_role_name,
+            PolicyName='CustomChunkingS3Access',
+            PolicyDocument=json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "s3:GetObject",
+                            "s3:PutObject",
+                            "s3:ListBucket",
+                            "s3:DeleteObject"
+                        ],
+                        "Resource": [
+                            f"arn:aws:s3:::{bucket_name}",
+                            f"arn:aws:s3:::{bucket_name}/*",
+                            f"arn:aws:s3:::{intermediate_bucket_name}",
+                            f"arn:aws:s3:::{intermediate_bucket_name}/*"
+                        ]
+                    }
+                ]
+            })
+        )
+        print(f"  ✅ KB role has S3 access to both buckets")
+        
+        # 2. Grant KB role permission to invoke the Lambda
+        lambda_arn_unqualified = f"arn:aws:lambda:{self.region_name}:{self.account_number}:function:{lambda_function_name}"
+        self.iam_client.put_role_policy(
+            RoleName=kb_role_name,
+            PolicyName='CustomChunkingLambdaInvoke',
+            PolicyDocument=json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": "lambda:InvokeFunction",
+                        "Resource": [
+                            lambda_arn_unqualified,
+                            f"{lambda_arn_unqualified}:*"
+                        ]
+                    }
+                ]
+            })
+        )
+        print(f"  ✅ KB role can invoke Lambda (unqualified + all qualifiers)")
+        
+        # 3. Lambda resource policy - allow Bedrock to invoke
+        statement_id = 'AllowBedrockInvoke'
+        try:
+            self.lambda_client.remove_permission(
+                FunctionName=lambda_function_name,
+                StatementId=statement_id
+            )
+        except self.lambda_client.exceptions.ResourceNotFoundException:
+            pass
+        
+        self.lambda_client.add_permission(
+            FunctionName=lambda_function_name,
+            StatementId=statement_id,
+            Action='lambda:InvokeFunction',
+            Principal='bedrock.amazonaws.com',
+            SourceAccount=self.account_number
+        )
+        print(f"  ✅ Lambda resource policy allows Bedrock invocation")
+        
+        # 4. Wait for IAM propagation
+        print("  ⏳ Waiting 10 seconds for IAM propagation...")
+        time.sleep(10)
+        print("  ✅ Permissions ready for custom chunking ingestion")
 
     def create_bedrock_execution_role_multi_ds(self, bucket_names=None, secrets_arns=None):
         """
@@ -770,7 +902,7 @@ class BedrockKnowledgeBase:
                             "enrichmentStrategyConfiguration": { 
                                 "method": "CHUNK_ENTITY_EXTRACTION"
                             },
-                            "modelArn": f"arn:aws:bedrock:{self.region_name}::foundation-model/{self.graph_model}"
+                            "modelArn": f"arn:aws:bedrock:{self.region_name}:*:inference-profile/{self.graph_model}"
                         },
                         "type": "BEDROCK_FOUNDATION_MODEL"
                 }

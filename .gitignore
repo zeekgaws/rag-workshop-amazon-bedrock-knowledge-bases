@@ -42,6 +42,10 @@ multimodal/rag/*.tar
 multimodal/rag/__pycache__/
 
 
+# local tool directories
+.kiro/
+.claude/
+
 # ignore cdk-related directories
 agents-for-bedrock/agent-blueprint-templates/node_modules
 agents-for-bedrock/agent-blueprint-templates/dist
