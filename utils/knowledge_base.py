@@ -15,6 +15,8 @@ valid_generation_models = ["anthropic.claude-3-5-sonnet-20240620-v1:0",
                           "anthropic.claude-3-5-haiku-20241022-v1:0", 
                           "anthropic.claude-3-sonnet-20240229-v1:0",
                           "anthropic.claude-3-haiku-20240307-v1:0",
+                          "anthropic.claude-sonnet-4-6",
+                          "anthropic.claude-haiku-4-5-20251001-v1:0",
                           "amazon.nova-micro-v1:0",
                           "us.amazon.nova-lite-v1:0",
                           "us.amazon.nova-micro-v1:0"] 
@@ -153,11 +155,77 @@ class BedrockKnowledgeBase:
             raise ValueError(f"Invalid Generation model. Your generation model should be one of {valid_generation_models}")
         if self.reranking_model not in valid_reranking_models:
             raise ValueError(f"Invalid Reranking model. Your reranking model should be one of {valid_reranking_models}")
+            
+    def _ensure_neptune_graph_permissions(self):
+        """
+        Ensures the current SageMaker execution role has Neptune Analytics 
+        permissions. This is idempotent - safe to run multiple times.
+        """
+        if self.vector_store != "NEPTUNE_ANALYTICS":
+            return
+        
+        
+        sts_client = boto3.client('sts')
+        caller_identity = sts_client.get_caller_identity()
+        role_arn = caller_identity['Arn']
+        account_id = caller_identity['Account']
+        
+        # Extract role name from assumed-role ARN
+        # Format: arn:aws:sts::ACCOUNT:assumed-role/ROLE_NAME/SESSION
+        role_name = role_arn.split('/')[1]
+        
+        neptune_graph_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "NeptuneAnalyticsFullAccess",
+                    "Effect": "Allow",
+                    "Action": [
+                        "neptune-graph:CreateGraph",
+                        "neptune-graph:DeleteGraph",
+                        "neptune-graph:GetGraph",
+                        "neptune-graph:ListGraphs",
+                        "neptune-graph:UpdateGraph",
+                        "neptune-graph:ResetGraph",
+                        "neptune-graph:CreateGraphUsingImportTask",
+                        "neptune-graph:GetImportTask",
+                        "neptune-graph:ListImportTasks",
+                        "neptune-graph:CancelImportTask",
+                        "neptune-graph:ExecuteQuery",
+                        "neptune-graph:ReadDataViaQuery",
+                        "neptune-graph:WriteDataViaQuery",
+                        "neptune-graph:DeleteDataViaQuery",
+                        "neptune-graph:GetGraphSummary",
+                        "neptune-graph:ListTagsForResource",
+                        "neptune-graph:TagResource",
+                        "neptune-graph:UntagResource"
+                    ],
+                    "Resource": f"arn:aws:neptune-graph:*:{account_id}:graph/*"
+                }
+            ]
+        }
+        
+        try:
+            self.iam_client.put_role_policy(
+                RoleName=role_name,
+                PolicyName="NeptuneAnalyticsAccessForBedrockWorkshop",
+                PolicyDocument=json.dumps(neptune_graph_policy)
+            )
+            print(f" Neptune Analytics permissions attached to role: {role_name}")
+            # Brief pause to allow IAM propagation
+            interactive_sleep(10)
+        except Exception as e:
+            print(f" Could not attach Neptune permissions: {e}")
+            print(f" Please manually add neptune-graph:* permissions to role: {role_name}")
 
     def _setup_resources(self):
         print("========================================================================================")
+        print("Step 0 - Ensuring SageMaker Execution Role has Neptune Analytics permissions")
+        self._ensure_neptune_graph_permissions() 
+        print("========================================================================================")
         print(f"Step 1 - Creating or retrieving S3 bucket(s) for Knowledge Base documents")
         self.create_s3_bucket()
+        
         
         print("========================================================================================")
         print(f"Step 2 - Creating Knowledge Base Execution Role ({self.kb_execution_role_name}) and Policies")
@@ -488,9 +556,12 @@ class BedrockKnowledgeBase:
                     "Effect": "Allow",
                     "Action": [
                         "bedrock:InvokeModel",
+                        "bedrock:GetInferenceProfile"
                     ],
                     "Resource": [
-                        f"arn:aws:bedrock:{self.region_name}::foundation-model/{self.embedding_model}"
+                        f"arn:aws:bedrock:{self.region_name}::foundation-model/{self.embedding_model}",
+                        f"arn:aws:bedrock:{self.region_name}:{self.account_number}:inference-profile/us.{self.graph_model}",
+                        f"arn:aws:bedrock:*::foundation-model/{self.graph_model}"
                     ]
                 },
                 {
@@ -902,7 +973,7 @@ class BedrockKnowledgeBase:
                             "enrichmentStrategyConfiguration": { 
                                 "method": "CHUNK_ENTITY_EXTRACTION"
                             },
-                            "modelArn": f"arn:aws:bedrock:{self.region_name}:*:inference-profile/{self.graph_model}"
+                            "modelArn": f"arn:aws:bedrock:{self.region_name}:{self.account_number}:inference-profile/us.{self.graph_model}"
                         },
                         "type": "BEDROCK_FOUNDATION_MODEL"
                 }
@@ -1398,6 +1469,10 @@ class BedrockKnowledgeBase:
                 else: 
                     self.iam_client.delete_policy(PolicyArn=policy_arn)
                     print(f"Deleted policy {policy_name} from role {role_name}")
+            inline_policies = self.iam_client.list_role_policies(RoleName=role_name)["PolicyNames"]
+            for policy_name in inline_policies:
+                self.iam_client.delete_role_policy(RoleName=role_name, PolicyName=policy_name)
+                print(f"Deleted inline policy {policy_name} from role {role_name}")
                 
             self.iam_client.delete_role(RoleName=role_name)
             print(f"Deleted role {role_name}")
